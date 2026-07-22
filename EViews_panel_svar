@@ -1,0 +1,430 @@
+'--------------------------------------------------------------------------------------------------
+' Eviews code to implement technique from:
+' Pedroni, Peter (2013) "Structural Panel VARs", Econometrics, 1 (2), 180-206.
+'
+' Download for reference paper:  http://www.mdpi.com/journal/econometrics
+'
+' Initial drafts of Eviews code by Alex Contreras, Central Bank of Peru.
+' Debugging and final draft by Xingwei Hu, IMF.
+'
+' NOTE: For testing purposes, this draft version is set up to read
+' the data file pedroni_ppp.xls, which is downloadable from estima.com.
+' The identification scheme is nonsensical for this particular data,
+' and does not correspond to any existing study. It is up to the user
+' to supply his or her own data file and corresponding identification
+' scheme.   Note also that the Eviews version of this code will produce
+' slightly different results than the RATS code due to very minor differences
+' in the algorithms of the lag selection routines.
+'--------------------------------------------------------------------------------------------------
+
+'create a panel workfile
+%data = @runpath + "/pedroni_ppp.xls"
+wfopen %data
+alpha date=@str(year)+"m"+@str(month)
+pagestruct country @date(date)
+
+
+'===========================
+' options
+'===========================
+!m=3 					'number of endogeous variables
+!Nsecs=20 			'number of cross sections
+'!Tperiods=246 	'time series dimension
+!maxlagsbar=12	'max lags for selecting lags in modeling averaging VAR model
+!maxlagsctry=12	'max lags for selecting lags in modeling cross-specific VAR model
+!ic=1 					'Information criterio for choose the lag of VAR model: LR=1,  AIC=3
+!nSteps=30 		'Lenght of IR function
+!trimtol=30.0		'convergence control
+!lower=0.25 		'quantile for calculate impulse response band ,lower bound
+!upper=0.75 		'quantile for calculate impulse response band,upper bound
+%averaging="median"	'using median as the averaging method
+!use_gtos_LR=0	'use the LR-GTOS method in lag length selection or not
+
+
+'======================
+' time series
+'======================
+series y1=log(ae*uscpi/cpi)
+series y2=log(cpi)
+series y3=log(ae)
+
+for !jj=1 to !m
+	series barvec{!jj} = @meansby(y{!jj},@cellid, "@all")
+
+	series tmp = @meansby(y{!jj},country, "@all")
+	series Z{!jj}=y{!jj} '-tmp '@meansby(y{!j},country, "@all")
+
+	series Zbar{!jj}=@meansby(Z{!jj}, @cellid, "@all")
+	series DZ{!jj} = D(Z{!jj})
+	series DZbar{!jj} = D( Zbar{!jj})
+next
+'group the variables
+group G1 DZ1 DZ2 DZ3
+group G2 DZbar1 DZbar2 DZbar3
+
+
+'===================================================
+' Estimation of VAR and SVAR model for time effect variables
+'===================================================
+for !R=1 to !Nsecs
+	smpl @all if @crossid=!R
+	var varestbar.ls 1 1 G2
+	varestbar.laglen(!maxlagsbar,VNAME = temp_lags)
+	!lagopt = temp_lags(!IC)
+	delete temp_lags
+'	if !use_gtos_LR=1 then
+'		call varlagselect_gtos(!lagopt, varestbar, G2.@members, !maxlagsbar)
+'	endif
+	var varestbar.ls 1 !lagopt G2
+	varestbar.makeresids(n=resgrbar{!R})
+	stomna(resgrbar{!R},resmatbar{!R})
+
+	' We recovery estructural composite shocks and save it in a matrix called srmat
+	matrix coefmat = varestbar.@coefmat
+	matrix(!m,!m) varlagsums = @identity(!m)
+	for !row=1 to !m
+		for !col=1 to !m
+			for !lag=1 to !lagopt
+				varlagsums(!row,!col) = varlagsums(!row,!col) - coefmat(!lag + (!row-1)*!lagopt, !col)
+			next
+		next
+	next
+	varlagsums = @transpose(varlagsums)
+	matrix varlagsums_inv = @inverse(varlagsums)
+
+	' non-dof adjusted residual covariance matrix
+	sym residcov = (varestbar.@regobs - varestbar.@ncoefs/!m)/(varestbar.@regobs) * varestbar.@residcov
+
+	sym qresidcov = varlagsums_inv * residcov * @transpose(varlagsums_inv)
+	matrix A1 = @cholesky(qresidcov)
+	matrix A0 = varlagsums*A1
+
+	matrix srmatbar{!R} = @transpose(@inverse(A0) * @transpose(resmatbar{!R}))
+	mtos(srmatbar{!R}, sresidsbar{!R})
+next
+close @objects
+
+
+'=======================================================
+' Estimation of VAR and SVAR model for every cross section
+'=======================================================
+' the lags automatically selected by the criteria
+vector(!Nsecs) laglength = 12
+'laglength(6)=7
+
+for !R=1 to !Nsecs
+
+	' Set the sample for every cross section unit
+	smpl @all if @crossid<!R+.1 and @crossid>!R-.1
+	!lagopt = 0
+	var varest{!R}.ls 1 1 G1
+	varest{!R}.laglen(!maxlagsctry,VNAME = temp_lags)
+	!lagopt = temp_lags(!ic)
+	delete temp_lags
+	if !use_gtos_LR=1 then
+		call varlagselect_gtos(!lagopt, varest{!R}, G1.@members, !maxlagsctry)
+	endif
+	laglength(!R) = !lagopt
+	'!lagopt = laglength(!R)
+	var varest{!R}.ls 1 !lagopt G1
+	varest{!R}.makeresids(n=resgr{!R})
+	smpl @all
+	stomna(resgr{!R},resmat{!R})
+
+	' We recovery estructural composite shocks and save it in a matrix called srmat
+	matrix coefmat = varest{!R}.@coefmat
+	matrix(!m,!m) varlagsums = @identity(!m)
+	for !row=1 to !m
+		for !col=1 to !m
+			for !lag=1 to !lagopt
+				varlagsums(!row,!col) = varlagsums(!row,!col) - coefmat(!lag + (!row-1)*!lagopt, !col)
+			next
+		next
+	next
+	varlagsums = @transpose(varlagsums)
+	matrix varlagsums_inv = @inverse(varlagsums)
+
+	' non-dof adjusted residual covariance matrix
+	sym residcov = (varestbar.@regobs - varestbar.@ncoefs/!m)/(varestbar.@regobs) * varest{!R}.@residcov
+	sym qresidcov = varlagsums_inv * residcov * @transpose(varlagsums_inv)
+	matrix A1 = @cholesky(qresidcov)
+	matrix A0 = varlagsums*A1
+	matrix srmat{!R} = @transpose(@inverse(A0) * @transpose(resmat{!R}))
+
+	mtos(srmat{!R},sresids{!R})
+	smpl @all if @crossid=!R
+	matrix lambda = @identity(!m)
+	matrix lambdatilde = @identity(!m)
+	for !k=1 to !m
+		'correlation between structural shocks
+		equation eq_tmp.ls sresids{!R}(!k) sresidsbar{!R}(!k)
+		lambda(!k,!k) = eq_tmp.@coefs(1)
+		lambdatilde(!k,!k) = @sqrt(1.0-(lambda(!k,!k))^2)
+	next
+
+	if @isobject("Aindctry") then
+		delete Aindctry
+	endif
+	varest{!R}.impulse(imp=user, fname=a0, matbys=Aindctry, !nSteps)
+
+	matrix(!m,!m) tempA
+	matrix(!m,!m) tempAbar
+	matrix(!m,!m) tempAtilde
+	for !ii=1 to !m
+		for !jj=1 to !m
+			vector(!nSteps) Abar{!ii}{!jj}
+			vector(!nSteps) Atilde{!ii}{!jj}
+			vector(!nSteps) Acomp{!ii}{!jj}
+		next
+	next
+	for !s=1 to !nSteps
+		for !ii=1 to !m
+			for !jj=1 to !m
+				tempA(!ii,!jj) = Aindctry(!s, !ii+(!jj-1)*!m)
+			next
+		next
+		tempAbar = tempA*lambda
+		tempAtilde = tempA*lambdatilde
+		for !ii=1 to !m
+			for !jj=1 to !m
+				Abar{!ii}{!jj}(!s) = tempAbar(!ii,!jj)
+				Atilde{!ii}{!jj}(!s) = tempAtilde(!ii,!jj)
+				Acomp{!ii}{!jj}(!s) = tempA(!ii,!jj)
+			next
+		next
+	next
+
+	for !ii=1 to !m
+		for !jj=1 to !m
+			vector(!nSteps) Abarcum{!ii}{!jj} = Abar{!ii}{!jj}
+			vector(!nSteps) Atildecum{!ii}{!jj} = Atilde{!ii}{!jj}
+			vector(!nSteps) Acompcum{!ii}{!jj} = Acomp{!ii}{!jj}
+			for !s=2 to !nSteps
+				Abarcum{!ii}{!jj}(!s) = Abarcum{!ii}{!jj}(!s-1) + Abar{!ii}{!jj}(!s)
+				Atildecum{!ii}{!jj}(!s) = Atildecum{!ii}{!jj}(!s-1) + Atilde{!ii}{!jj}(!s)
+				Acompcum{!ii}{!jj}(!s) = Acompcum{!ii}{!jj}(!s-1) + Acomp{!ii}{!jj}(!s)
+			next
+		next
+	next
+
+	for !ii=1 to !nSteps
+		for !jj=1 to 2*!m*!m
+			vector(!Nsecs) IRstoremat{!ii}{!jj}
+		next
+	next
+	for !s=1 to !nSteps
+		!count = 0
+		for !ii=1 to !m
+			for !jj=1 to !m
+				!count = !count+1
+				IRstoremat{!s}{!count}(!R) = Abarcum{!ii}{!jj}(!s)
+				if @abs(Acompcum12(!nSteps)) > !trimtol then
+					IRstoremat{!s}{!count}(!R) = na
+				endif
+			next
+		next
+	next
+
+	for !ii=1 to !nSteps
+		for !jj=1 to !m*!m
+			vector(!Nsecs) Acompstore{!ii}{!jj}
+			vector(!Nsecs) Atildestore{!ii}{!jj}
+			vector(!Nsecs) Abarstore{!ii}{!jj}
+		next
+	next
+	for !s=1 to !nSteps
+		!count = 0
+		for !jj=1 to !m
+			for !ii=1 to !m
+				!count = !count+1
+				Acompstore{!s}{!count}(!R) = Acompcum{!ii}{!jj}(!s)
+				Abarstore{!s}{!count}(!R) = Abarcum{!ii}{!jj}(!s)
+				Atildestore{!s}{!count}(!R) = Atildecum{!ii}{!jj}(!s)
+
+				if @abs(Acompcum12(!nSteps)) > !trimtol  then
+					Acompstore{!s}{!count}(!R) = na
+					Abarstore{!s}{!count}(!R) = na
+					Atildestore{!s}{!count}(!R) = na
+				endif
+
+			next
+		next
+	next
+	close @objects
+next
+
+
+'=======================================================
+' Extracting the structural shocks and output the results
+'=======================================================
+matrix(!nSteps, 2*!m*!m) IRmeanmat
+matrix(!nSteps, 2*!m*!m) IRf25mat
+matrix(!nSteps, 2*!m*!m) IRf75mat
+for !jj=1 to 2*!m*!m
+	vector(!nSteps) IRmeandecomps{!jj}
+	vector(!nSteps) IRf25decomps{!jj}
+	vector(!nSteps) IRf75decomps{!jj}
+next
+
+for !ii=1 to !nsteps
+	for !jj=1 to !m*!m*2
+		vector sorted_v = @sort(IRstoremat{!ii}{!jj})
+		freeze(tmp_tb, mode=overwrite) sorted_v.stats
+		IRmeanmat(!ii,!jj) = @mean(sorted_v)
+		if %averaging = "median" then
+			IRmeanmat(!ii,!jj) = @median(sorted_v)
+		endif
+		IRf25mat(!ii,!jj) = sorted_v(!Nsecs*!lower)
+		IRf75mat(!ii,!jj) = sorted_v(!Nsecs*!upper)
+	next
+next
+
+for !ii=1 to !nsteps
+	for !jj=1 to !m*!m*2
+		IRmeandecomps{!jj}(!ii)  = IRmeanmat(!ii,!jj)
+		IRf25decomps{!jj}(!ii)  = IRf25mat(!ii,!jj)
+		IRf75decomps{!jj}(!ii)  = IRf75mat(!ii,!jj)
+	next
+next
+
+for %s comp bar tilde
+	matrix(!nsteps,!m*!m) A{%s}meanmat
+	matrix(!nsteps,!m*!m) A{%s}f25mat
+	matrix(!nsteps,!m*!m) A{%s}f75mat
+next
+
+for !ii=1 to !m*!m
+	for %s comp bar tilde
+		vector(!nSteps) A{%s}IRmean{!ii}
+		vector(!nSteps) A{%s}IRf25{!ii}
+		vector(!nSteps) A{%s}IRf75{!ii}
+	next
+next
+
+
+for !ii=1 to !nsteps
+	for !jj=1 to !m*!m
+		for %s comp bar tilde
+			vector sorted_v = @sort(A{%s}store{!ii}{!jj})
+			freeze(tmp_tb, mode=overwrite) sorted_v.stats
+			A{%s}meanmat(!ii,!jj) = @mean(sorted_v)
+			if %averaging = "median" then
+				A{%s}meanmat(!ii,!jj) = @median(sorted_v)
+			endif
+			A{%s}f25mat(!ii,!jj) = sorted_v(!Nsecs*!lower)
+			A{%s}f75mat(!ii,!jj) = sorted_v(!Nsecs*!upper)
+		next
+	next
+next
+
+
+for !ii=1 to !nsteps
+	for !jj=1 to !m*!m
+		for %s comp bar tilde
+			A{%s}IRmean{!jj}(!ii)  = A{%s}meanmat(!ii,!jj)
+			A{%s}IRf25{!jj}(!ii)  = A{%s}f25mat(!ii,!jj)
+			A{%s}IRf75{!jj}(!ii) = A{%s}f75mat(!ii,!jj)
+		next
+	next
+next
+
+
+for !j=1 to !m*!m
+	for %s comp bar tilde
+		matrix(!nSteps,3) g_{%s}{!j}
+		colplace(g_{%s}{!j}, A{%s}IRmean{!j}, 1)
+		colplace(g_{%s}{!j}, A{%s}IRf25{!j}, 2)
+		colplace(g_{%s}{!j}, A{%s}IRf75{!j}, 3)
+		freeze(fig_{%s}{!j},mode=overwrite) g_{%s}{!j}.line
+		fig_{%s}{!j}.setelem(1) legend("median")
+		fig_{%s}{!j}.setelem(2) legend("75 percentile")
+		fig_{%s}{!j}.setelem(3) legend("25 percentile")
+		fig_{%s}{!j}.legend columns(3)
+		close fig_{%s}{!j}
+	next
+	close g_comm{!j} g_comp{!j} g_idios{!j}
+next
+
+for !i=1 to !m
+	for !j=1 to !m
+		!k=(!i-1)*!m+!j
+		%s =  "response of  variable "+@str(!j) +" to composite e"+@str(!i) +" shock"
+		fig_comp{!k}.addtext(t, font(14))  {%s}
+		%s =  "response of  variable "+@str(!j) +" to common e"+@str(!i) +" shock"
+		fig_bar{!k}.addtext(t,font(14))  {%s}
+		%s =  "response of  variable "+@str(!j) +" to idiosyncratic e"+@str(!i) +" shock"
+		fig_tilde{!k}.addtext(t,font(14))  {%s}
+	next
+next
+close @objects
+
+svector(3) Fig_title
+Fig_title(1) = "Figure 1.  Response Estimates to Componsite Shocks"
+Fig_title(2) = "Figure 2.  Response Estimates to Common Shocks"
+Fig_title(3) = "Figure 3.  Response Estimates to Idiosyncratic Shocks"
+!j=1
+for %s comp bar tilde
+     graph fig_{%s}_all.merge fig_{%s}1 fig_{%s}4 fig_{%s}7 fig_{%s}2 fig_{%s}5 fig_{%s}8 fig_{%s}3 fig_{%s}6 fig_{%s}9
+	fig_{%s}_all.align(3,3,2)
+	%title = Fig_title(!j)
+	fig_{%s}_all.addtext(t, font(30)) {%title}
+	show fig_{%s}_all
+	delete fig_{%s}1 fig_{%s}2 fig_{%s}3 fig_{%s}4 fig_{%s}5 fig_{%s}6 fig_{%s}7 fig_{%s}8 fig_{%s}9
+	!j=!j+1
+next
+
+
+
+' use the gtos LR criterion to calculate the optimal lag length of a VAR
+'
+' Usage example:
+'
+'		!lag=0
+'		vector(20) myLags
+'		%endo = " DZ1 DZ2 DZ3 "
+'		for !iii=1 to 20
+'			call varlagselect(!lag, varest{!iii}, %endo, 12)
+'			myLags(!iii) = !lag
+'		next
+'
+' Compared with the RATS procedure %varlagselect with gtos option, there are two issues:
+'	1.concentrated log likelihoodis not used, i.e. the procedure %logconcdensity
+'	2.the common sample is not used in VARs with different lags
+'
+' Compared with Eviews' laglen function with LR option, Sims(1980)'s modification is not used.
+subroutine varlagselect_gtos(scalar lag, VAR varobj, string endo, scalar MaxLagLen)
+	%endo = endo
+	%sp = varobj.@smpl
+	!k=varobj.@neqn
+	!crit_value = @qchisq(.95, !k*!k)
+	%name = varobj.@name
+	matrix(1+MaxLagLen,4) ll_{%name} = 0
+	for !i=1 to 1+MaxLagLen
+		ll_{%name}(!i,1) = !i-1
+	next
+	!log2pi = log(2*3.14159265)
+
+	for !i=1 to MaxLagLen
+		smpl {%sp}
+		varobj.ls 1 !i {%endo}  @ C
+		!t = varobj.@regobs
+		varobj.makeresid g1
+	 	stom(g1, g1mat)
+	 	sym g1mat2 = @transpose(g1mat) * g1mat / !t
+		ll_{%name}(!i+1,2) = !t
+
+		' Hamilton(1994), Time Series Analysis, formula (11.1.32), page 296
+		ll_{%name}(!i+1,3) = -.5*!k*!t*!log2pi - .5*!t*log(@det(g1mat2)) - .5*!t*!k
+	next
+
+	lag = MaxLagLen
+	for !i=2 to 1+MaxLagLen
+		ll_{%name}(!i,4) = -2*(ll_{%name}(!i,3)-ll_{%name}(!i-1,3))
+	next
+	for !i=1 to MaxLagLen
+		if ll_{%name}(2+MaxLagLen-!i,4)>!crit_value then
+			lag = MaxLagLen+1-!i
+			!i = MaxLagLen+1
+		endif
+	next
+endsub
